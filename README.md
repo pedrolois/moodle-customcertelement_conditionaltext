@@ -13,9 +13,24 @@ condition and the text to print when the condition is met.
 | Condition | Options |
 |---|---|
 | **Grade** | Course total or any grade item / activity; `≥ > ≤ < = ≠`; value as a percentage or in points |
-| **Course completion** | Has completed / has not completed the course |
+| **Course completion** | The learner has completed the course |
+| **Course progress (%)** | Percentage of tracked activities completed, as in the course progress bar |
+| **Activity completion** | The learner has completed (or passed) a given activity |
 | **User profile field** | Standard fields (department, institution, city, country, language, ...) or custom profile fields; *is equal to, is not equal to, contains, does not contain, is empty, is not empty* |
-| **Always** | Always matches (an explicit catch-all) |
+| **Group** | Member of a group of the course |
+| **Cohort** | Member of a cohort |
+| **Role in the course** | For example Non-editing teacher → "as Facilitator" |
+| **Badge earned** | A site badge or a badge of the course |
+| **Competency achieved** | Rated proficient in a competency of the course |
+| **Enrolment method** | Enrolled through manual, self, PayPal, ... enrolment |
+| **Date** | Completion, certificate issue or enrolment date, before / on or after a date |
+| **Time spent in the course** | Hours, computed from the logs like the certificate's "required time" |
+| **Days to complete the course** | Days from enrolment to completion (for example "fast track" ≤ 30 days) |
+| **Always** | Matches everybody |
+
+Every rule can be **inverted** (apply when the condition is *not* met) and **combined with the next rule**
+(AND): a chain of combined rules prints the text of its last rule only when all of them are met.
+To express OR, add separate rules with the same text.
 
 - **First matching rule** (default): rules are checked from top to bottom and the first match wins.
   Order them from the most to the least demanding (90 %, then 75 %, then 50 %).
@@ -30,6 +45,13 @@ Example:
 | 2 | Course total ≥ 75 % | `WITH MERIT` |
 | Otherwise | | `Successfully completed` |
 
+### Ready-made examples
+
+The **Load an example** menu fills the form with a set of rules you can adapt before saving:
+Distinction / Merit / Pass, Passed or attended, Excellent / Very good / Good, Completed or participated,
+Achievement lines, With honours (two conditions), By preferred language, By department, By group, By cohort,
+Facilitator or participant, Hours of training, Fast track and By course progress.
+
 Rule texts support HTML, Moodle filters (for example multi-language content) and these placeholders:
 `{firstname}`, `{lastname}`, `{fullname}`, `{coursename}`, `{courseshortname}`, `{coursegrade}`.
 Font, size, colour, width, position and alignment work like the standard Text element.
@@ -41,7 +63,9 @@ Font, size, colour, width, position and alignment work like the standard Text el
 - Learners without a grade never match a grade rule.
 - In the certificate preview and in the drag-and-drop editor, the first rule's text is shown.
 - Custom profile fields that are hidden from everyone are only offered to designers who can view all user details.
-- Template export/import and course backup/restore are supported; grade item references are remapped on restore.
+- Template export/import and course backup/restore are supported; grade item, activity, group and course badge references are remapped on restore.
+- Rules that point to something that no longer exists (a deleted group, activity, badge...) never apply,
+  inverted or not.
 
 ## Requirements
 

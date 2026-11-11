@@ -18,9 +18,8 @@ declare(strict_types=1);
 
 namespace customcertelement_conditionaltext;
 
-use availability_profile\condition as profile_condition;
-use core_collator;
-use core_user\fields;
+use customcertelement_conditionaltext\local\form_options;
+use customcertelement_conditionaltext\local\presets;
 use customcertelement_conditionaltext\local\rule_evaluator;
 use mod_customcert\element as base_element;
 use mod_customcert\element\form_element_interface;
@@ -38,8 +37,7 @@ use restore_customcert_activity_task;
 use stdClass;
 
 /**
- * Conditional text element: shows different text depending on the recipient's
- * grade, course completion or profile data.
+ * Conditional text element: prints different text depending on the certificate recipient.
  *
  * @package    customcertelement_conditionaltext
  * @copyright  2026 Pedro Lois {@link https://github.com/pedrolois}
@@ -59,6 +57,9 @@ class element extends base_element implements
     /** @var string Show the texts of every matching rule, one per line. */
     public const string MATCH_ALL = 'all';
 
+    /** @var string Combine value: the next rule must also be met. */
+    public const string COMBINE_AND = 'and';
+
     /** @var int Maximum number of rules stored per element. */
     public const int MAX_RULES = 50;
 
@@ -67,11 +68,24 @@ class element extends base_element implements
         '{firstname}', '{lastname}', '{fullname}', '{coursename}', '{courseshortname}', '{coursegrade}',
     ];
 
-    /** @var string[] Names of the repeated per-rule form fields. */
-    private const array RULE_FIELDS = [
-        'ruletype', 'rulegradeitem', 'rulegradeop', 'rulegradevalue', 'rulegradeunit',
-        'rulecompletion', 'ruleprofilefield', 'ruleprofileop', 'ruleprofilevalue', 'ruletext',
+    /** @var string[] Stored rule keys that have a "rule<key>" field in the form. */
+    private const array RULE_KEYS = [
+        'type', 'negate', 'gradeitem', 'gradeop', 'gradevalue', 'gradeunit', 'cmid', 'profilefield', 'profileop',
+        'profilevalue', 'groupid', 'cohortid', 'roleid', 'badgeid', 'competencyid', 'enrol', 'datesource', 'dateop',
+        'date', 'progressop', 'progressvalue', 'hoursop', 'hoursvalue', 'daysop', 'daysvalue', 'combine', 'text',
     ];
+
+    /** @var array<string,string> Rule types that need a choice in a select: type => stored key. */
+    private const array REQUIRED_CHOICES = [
+        'activity' => 'cmid', 'group' => 'groupid', 'cohort' => 'cohortid', 'role' => 'roleid',
+        'badge' => 'badgeid', 'competency' => 'competencyid', 'enrolment' => 'enrol',
+    ];
+
+    /** @var string Plugin component, for strings. */
+    private const string COMPONENT = 'customcertelement_conditionaltext';
+
+    /** @var array|null Preset loaded through the examples menu, if any. */
+    private ?array $preset = null;
 
     /**
      * Build the configuration form for this element.
@@ -80,25 +94,27 @@ class element extends base_element implements
      * @return void
      */
     public function build_form(MoodleQuickForm $mform): void {
-        $component = 'customcertelement_conditionaltext';
+        $mform->addElement('static', 'conditionalintro', '', get_string('intro', self::COMPONENT));
 
-        $mform->addElement('static', 'conditionalintro', '', get_string('intro', $component));
+        $this->preset = $this->get_requested_preset();
+        $mform->addElement('static', 'examples', get_string('examples', self::COMPONENT), $this->render_examples_menu());
+        $mform->addHelpButton('examples', 'examples', self::COMPONENT);
 
-        $mform->addElement('select', 'matchmode', get_string('matchmode', $component), [
-            self::MATCH_FIRST => get_string('matchmode_first', $component),
-            self::MATCH_ALL => get_string('matchmode_all', $component),
+        $mform->addElement('select', 'matchmode', get_string('matchmode', self::COMPONENT), [
+            self::MATCH_FIRST => get_string('matchmode_first', self::COMPONENT),
+            self::MATCH_ALL => get_string('matchmode_all', self::COMPONENT),
         ]);
-        $mform->addHelpButton('matchmode', 'matchmode', $component);
+        $mform->addHelpButton('matchmode', 'matchmode', self::COMPONENT);
 
         $this->build_rules($mform);
 
-        $mform->addElement('header', 'otherwiseheader', get_string('otherwise', $component));
+        $mform->addElement('header', 'otherwiseheader', get_string('otherwise', self::COMPONENT));
         $mform->setExpanded('otherwiseheader');
-        $mform->addElement('textarea', 'defaulttext', get_string('defaulttext', $component), ['rows' => 3, 'cols' => 60]);
+        $mform->addElement('textarea', 'defaulttext', get_string('defaulttext', self::COMPONENT), ['rows' => 3, 'cols' => 60]);
         $mform->setType('defaulttext', PARAM_RAW);
-        $mform->addHelpButton('defaulttext', 'defaulttext', $component);
+        $mform->addHelpButton('defaulttext', 'defaulttext', self::COMPONENT);
 
-        $mform->addElement('header', 'appearanceheader', get_string('appearance', $component));
+        $mform->addElement('header', 'appearanceheader', get_string('appearance', self::COMPONENT));
         $mform->setExpanded('appearanceheader');
 
         element_helper::render_common_form_elements($mform, $this->showposxy);
@@ -111,112 +127,155 @@ class element extends base_element implements
      * @return void
      */
     private function build_rules(MoodleQuickForm $mform): void {
-        $component = 'customcertelement_conditionaltext';
-        $types = [
-            rule_evaluator::TYPE_GRADE => get_string('type_grade', $component),
-            rule_evaluator::TYPE_COMPLETION => get_string('type_completion', $component),
-            rule_evaluator::TYPE_PROFILE => get_string('type_profile', $component),
-            rule_evaluator::TYPE_ALWAYS => get_string('type_always', $component),
-        ];
-        $gradeops = [];
-        foreach (rule_evaluator::GRADE_OPERATORS as $op) {
-            $gradeops[$op] = get_string('op_' . $op, $component);
-        }
-        $profileops = [];
-        foreach (rule_evaluator::PROFILE_OPERATORS as $op) {
-            $profileops[$op] = get_string('op_' . $op, $component);
-        }
+        global $COURSE;
+
+        $c = self::COMPONENT;
+        $options = new form_options($COURSE);
+        $str = fn(string $id): string => get_string($id, $c);
+        $list = fn(array $keys, string $prefix): array => array_combine(
+            $keys,
+            array_map(fn(string $key): string => get_string($prefix . $key, $c), $keys)
+        );
+        $types = $list(rule_evaluator::TYPES, 'type_');
+        $numops = $list(rule_evaluator::GRADE_OPERATORS, 'op_');
 
         $repeat = [];
-        $repeat[] = $mform->createElement('header', 'ruleheader', get_string('rulenumber', $component, '{no}'));
-        $repeat[] = $mform->createElement('select', 'ruletype', get_string('ruletype', $component), $types);
-        $repeat[] = $mform->createElement(
-            'select',
-            'rulegradeitem',
-            get_string('gradeitem', $component),
-            self::get_grade_source_options()
-        );
-        $repeat[] = $mform->createElement('group', 'rulegradegroup', get_string('gradecondition', $component), [
-            $mform->createElement('select', 'rulegradeop', '', $gradeops),
+        $repeat[] = $mform->createElement('header', 'ruleheader', get_string('rulenumber', $c, '{no}'));
+        $repeat[] = $mform->createElement('select', 'ruletype', $str('ruletype'), $types);
+        $repeat[] = $mform->createElement('select', 'rulegradeitem', $str('gradeitem'), $options->grade_sources());
+        $repeat[] = $mform->createElement('group', 'rulegradegroup', $str('gradecondition'), [
+            $mform->createElement('select', 'rulegradeop', '', $numops),
             $mform->createElement('text', 'rulegradevalue', '', ['size' => 6]),
             $mform->createElement('select', 'rulegradeunit', '', [
-                rule_evaluator::UNIT_PERCENT => get_string('unit_percent', $component),
-                rule_evaluator::UNIT_POINTS => get_string('unit_points', $component),
+                rule_evaluator::UNIT_PERCENT => $str('unit_percent'),
+                rule_evaluator::UNIT_POINTS => $str('unit_points'),
             ]),
         ], ' ', false);
-        $repeat[] = $mform->createElement('select', 'rulecompletion', get_string('completionstate', $component), [
-            rule_evaluator::COMPLETION_COMPLETE => get_string('completion_complete', $component),
-            rule_evaluator::COMPLETION_INCOMPLETE => get_string('completion_incomplete', $component),
-        ]);
-        $repeat[] = $mform->createElement(
-            'select',
-            'ruleprofilefield',
-            get_string('profilefield', $component),
-            self::get_profile_field_options()
-        );
-        $repeat[] = $mform->createElement('group', 'ruleprofilegroup', get_string('profilecondition', $component), [
-            $mform->createElement('select', 'ruleprofileop', '', $profileops),
+        $repeat[] = $mform->createElement('group', 'ruleprogressgroup', $str('progresscondition'), [
+            $mform->createElement('select', 'ruleprogressop', '', $numops),
+            $mform->createElement('text', 'ruleprogressvalue', '', ['size' => 6]),
+            $mform->createElement('static', 'ruleprogressunit', '', '%'),
+        ], ' ', false);
+        $repeat[] = $mform->createElement('select', 'rulecmid', $str('activity'), $options->activities());
+        $repeat[] = $mform->createElement('select', 'ruleprofilefield', $str('profilefield'), $options->profile_fields());
+        $repeat[] = $mform->createElement('group', 'ruleprofilegroup', $str('profilecondition'), [
+            $mform->createElement('select', 'ruleprofileop', '', $list(rule_evaluator::PROFILE_OPERATORS, 'op_')),
             $mform->createElement('text', 'ruleprofilevalue', '', ['size' => 20]),
         ], ' ', false);
+        $repeat[] = $mform->createElement('select', 'rulegroupid', get_string('group'), $options->groups());
+        $repeat[] = $mform->createElement('select', 'rulecohortid', get_string('cohort', 'cohort'), $options->cohorts());
+        $repeat[] = $mform->createElement('select', 'ruleroleid', get_string('role'), $options->roles());
+        $repeat[] = $mform->createElement('select', 'rulebadgeid', $str('badge'), $options->badges());
         $repeat[] = $mform->createElement(
-            'textarea',
-            'ruletext',
-            get_string('ruletext', $component),
-            ['rows' => 3, 'cols' => 60]
+            'select',
+            'rulecompetencyid',
+            get_string('competency', 'core_competency'),
+            $options->competencies()
         );
-        $repeat[] = $mform->createElement('submit', 'ruledelete', get_string('deleterule', $component), [], false);
+        $repeat[] = $mform->createElement('select', 'ruleenrol', $str('enrolmentmethod'), $options->enrolment_methods());
+        $repeat[] = $mform->createElement('group', 'ruledategroup', $str('datecondition'), [
+            $mform->createElement('select', 'ruledatesource', '', $list(rule_evaluator::DATE_SOURCES, 'datesource_')),
+            $mform->createElement('select', 'ruledateop', '', $list(rule_evaluator::DATE_OPERATORS, 'dateop_')),
+        ], ' ', false);
+        $repeat[] = $mform->createElement('date_selector', 'ruledate', $str('date'));
+        $repeat[] = $mform->createElement('group', 'rulehoursgroup', $str('hourscondition'), [
+            $mform->createElement('select', 'rulehoursop', '', $numops),
+            $mform->createElement('text', 'rulehoursvalue', '', ['size' => 6]),
+            $mform->createElement('static', 'rulehoursunit', '', $str('unit_hours')),
+        ], ' ', false);
+        $repeat[] = $mform->createElement('group', 'ruledaysgroup', $str('dayscondition'), [
+            $mform->createElement('select', 'ruledaysop', '', $numops),
+            $mform->createElement('text', 'ruledaysvalue', '', ['size' => 6]),
+            $mform->createElement('static', 'ruledaysunit', '', $str('unit_days')),
+        ], ' ', false);
+        $repeat[] = $mform->createElement('advcheckbox', 'rulenegate', $str('negate'), $str('negate_label'));
+        $repeat[] = $mform->createElement('select', 'rulecombine', $str('combine'), [
+            '' => $str('combine_none'),
+            self::COMBINE_AND => $str('combine_and'),
+        ]);
+        $repeat[] = $mform->createElement('textarea', 'ruletext', $str('ruletext'), ['rows' => 3, 'cols' => 60]);
+        $repeat[] = $mform->createElement('submit', 'ruledelete', $str('deleterule'), [], false);
 
-        $options = [
-            'ruleheader' => ['expanded' => true],
+        // Show each field only for the rule types that use it.
+        $onlyfor = fn(string ...$only): array => ['hideif' => ['ruletype', 'in', array_values(array_diff(
+            rule_evaluator::TYPES,
+            $only
+        ))]];
+        $repeatoptions = [
             'ruletype' => ['default' => rule_evaluator::TYPE_GRADE],
-            'rulegradeitem' => ['hideif' => ['ruletype', 'neq', rule_evaluator::TYPE_GRADE]],
-            'rulegradegroup' => ['hideif' => ['ruletype', 'neq', rule_evaluator::TYPE_GRADE]],
+            'rulegradeitem' => $onlyfor('grade'),
+            'rulegradegroup' => $onlyfor('grade'),
             'rulegradeop' => ['default' => 'gte'],
             'rulegradevalue' => ['type' => PARAM_RAW_TRIMMED],
-            'rulecompletion' => ['hideif' => ['ruletype', 'neq', rule_evaluator::TYPE_COMPLETION]],
-            'ruleprofilefield' => ['hideif' => ['ruletype', 'neq', rule_evaluator::TYPE_PROFILE]],
-            'ruleprofilegroup' => ['hideif' => ['ruletype', 'neq', rule_evaluator::TYPE_PROFILE]],
+            'ruleprogressgroup' => $onlyfor('progress'),
+            'ruleprogressop' => ['default' => 'gte'],
+            'ruleprogressvalue' => ['type' => PARAM_RAW_TRIMMED],
+            'rulecmid' => $onlyfor('activity') + ['type' => PARAM_INT],
+            'ruleprofilefield' => $onlyfor('profile'),
+            'ruleprofilegroup' => $onlyfor('profile'),
             'ruleprofilevalue' => ['type' => PARAM_TEXT],
-            'ruletext' => ['type' => PARAM_RAW, 'helpbutton' => ['ruletext', $component]],
+            'rulegroupid' => $onlyfor('group') + ['type' => PARAM_INT],
+            'rulecohortid' => $onlyfor('cohort') + ['type' => PARAM_INT],
+            'ruleroleid' => $onlyfor('role') + ['type' => PARAM_INT],
+            'rulebadgeid' => $onlyfor('badge') + ['type' => PARAM_INT],
+            'rulecompetencyid' => $onlyfor('competency') + ['type' => PARAM_INT],
+            'ruleenrol' => $onlyfor('enrolment') + ['type' => PARAM_PLUGIN],
+            'ruledategroup' => $onlyfor('date'),
+            'ruledate' => $onlyfor('date'),
+            'rulehoursgroup' => $onlyfor('timespent'),
+            'rulehoursop' => ['default' => 'gte'],
+            'rulehoursvalue' => ['type' => PARAM_RAW_TRIMMED],
+            'ruledaysgroup' => $onlyfor('completiondays'),
+            'ruledaysop' => ['default' => 'lte'],
+            'ruledaysvalue' => ['type' => PARAM_RAW_TRIMMED],
+            'rulenegate' => ['hideif' => ['ruletype', 'eq', rule_evaluator::TYPE_ALWAYS]],
+            'ruletext' => ['type' => PARAM_RAW, 'hideif' => ['rulecombine', 'eq', self::COMBINE_AND]],
         ];
 
-        $count = max(1, count($this->get_rules()));
+        $count = max(1, count($this->get_form_rules()));
         $repeats = $this->get_edit_element_form()->repeat_elements(
             $repeat,
             $count,
-            $options,
+            $repeatoptions,
             'rule_repeats',
             'rule_add',
             1,
-            get_string('addrule', $component),
+            $str('addrule'),
             false,
             'ruledelete'
         );
-        // Hide the operand when the operator does not need one.
+        // Expanded sections, help icons and the operand visibility are set here rather than through
+        // the repeat options, because those are also applied to deleted rules, which no longer exist.
         for ($i = 0; $i < $repeats; $i++) {
-            if ($mform->elementExists("ruleprofilevalue[$i]")) {
-                $mform->hideIf("ruleprofilevalue[$i]", "ruleprofileop[$i]", 'in', ['empty', 'notempty']);
+            if (!$mform->elementExists("ruletype[$i]")) {
+                continue;
             }
+            $mform->setExpanded("ruleheader[$i]");
+            $mform->addHelpButton("ruletype[$i]", 'ruletype', $c);
+            $mform->addHelpButton("rulenegate[$i]", 'negate', $c);
+            $mform->addHelpButton("rulecombine[$i]", 'combine', $c);
+            $mform->addHelpButton("ruletext[$i]", 'ruletext', $c);
+            $mform->hideIf("ruleprofilevalue[$i]", "ruleprofileop[$i]", 'in', ['empty', 'notempty']);
         }
     }
 
     /**
-     * Pre-populate the form from the stored payload.
+     * Pre-populate the form from the stored payload (or from the requested example).
      *
      * @param MoodleQuickForm $mform
      * @return void
      */
     public function prepare_form(MoodleQuickForm $mform): void {
-        $payload = $this->get_payload();
+        $payload = $this->preset ?? $this->get_payload();
         $mform->setDefault('matchmode', $payload['matchmode'] ?? self::MATCH_FIRST);
         $mform->setDefault('defaulttext', (string)($payload['defaulttext'] ?? ''));
 
-        foreach ($this->get_rules() as $i => $rule) {
-            foreach (self::RULE_FIELDS as $field) {
-                $key = substr($field, 4); // Strip the "rule" prefix.
-                if (array_key_exists($key, $rule)) {
-                    $mform->setDefault("{$field}[{$i}]", $rule[$key]);
+        foreach ($this->get_form_rules() as $i => $rule) {
+            foreach (self::RULE_KEYS as $key) {
+                if ($key === 'date' && empty($rule['date'])) {
+                    continue;
                 }
+                $mform->setDefault("rule{$key}[{$i}]", $rule[$key]);
             }
         }
     }
@@ -228,18 +287,33 @@ class element extends base_element implements
      * @return array<string,string>
      */
     public function validate(array $data): array {
+        $c = self::COMPONENT;
         $errors = [];
         $types = (array)($data['ruletype'] ?? []);
+        $numeric = fn(string $field, int|string $i): bool =>
+            is_numeric(unformat_float(trim((string)($data[$field][$i] ?? '')), true));
+
         foreach ($types as $i => $type) {
-            if ($type === rule_evaluator::TYPE_GRADE) {
-                $value = trim((string)($data['rulegradevalue'][$i] ?? ''));
-                if ($value === '' || !is_numeric(unformat_float($value, true))) {
-                    $errors["rulegradegroup[$i]"] = get_string('errorgradevalue', 'customcertelement_conditionaltext');
-                }
+            if ($type === rule_evaluator::TYPE_GRADE && !$numeric('rulegradevalue', $i)) {
+                $errors["rulegradegroup[$i]"] = get_string('errornumber', $c);
+            } else if ($type === rule_evaluator::TYPE_PROGRESS && !$numeric('ruleprogressvalue', $i)) {
+                $errors["ruleprogressgroup[$i]"] = get_string('errornumber', $c);
+            } else if ($type === rule_evaluator::TYPE_TIMESPENT && !$numeric('rulehoursvalue', $i)) {
+                $errors["rulehoursgroup[$i]"] = get_string('errornumber', $c);
+            } else if ($type === rule_evaluator::TYPE_COMPLETIONDAYS && !$numeric('ruledaysvalue', $i)) {
+                $errors["ruledaysgroup[$i]"] = get_string('errornumber', $c);
+            } else if (isset(self::REQUIRED_CHOICES[$type]) && empty($data['rule' . self::REQUIRED_CHOICES[$type]][$i])) {
+                $errors['rule' . self::REQUIRED_CHOICES[$type] . "[$i]"] = get_string('errorchoose', $c);
+            }
+        }
+        if ($types) {
+            $last = array_key_last($types);
+            if (($data['rulecombine'][$last] ?? '') === self::COMBINE_AND) {
+                $errors["rulecombine[$last]"] = get_string('errorcombinelast', $c);
             }
         }
         if (count($types) > self::MAX_RULES) {
-            $errors['rule_add'] = get_string('errortoomanyrules', 'customcertelement_conditionaltext', self::MAX_RULES);
+            $errors['rule_add'] = get_string('errortoomanyrules', $c, self::MAX_RULES);
         }
         return $errors;
     }
@@ -252,16 +326,18 @@ class element extends base_element implements
      */
     public function normalise_data(stdClass $formdata): array {
         $rules = [];
-        foreach ((array)($formdata->ruletype ?? []) as $i => $type) {
-            $raw = ['type' => $type];
-            foreach (self::RULE_FIELDS as $field) {
-                $values = (array)($formdata->$field ?? []);
+        foreach (array_keys((array)($formdata->ruletype ?? [])) as $i) {
+            $raw = [];
+            foreach (self::RULE_KEYS as $key) {
+                $values = (array)($formdata->{'rule' . $key} ?? []);
                 if (array_key_exists($i, $values)) {
-                    $raw[substr($field, 4)] = $values[$i];
+                    $raw[$key] = $values[$i];
                 }
             }
-            if (isset($raw['gradevalue'])) {
-                $raw['gradevalue'] = (string)unformat_float((string)$raw['gradevalue'], true);
+            foreach (['gradevalue', 'progressvalue', 'hoursvalue', 'daysvalue'] as $key) {
+                if (isset($raw[$key])) {
+                    $raw[$key] = (string)unformat_float((string)$raw[$key], true);
+                }
             }
             $rules[] = $raw;
         }
@@ -290,28 +366,47 @@ class element extends base_element implements
             return [];
         }
 
-        $types = [rule_evaluator::TYPE_GRADE, rule_evaluator::TYPE_COMPLETION,
-            rule_evaluator::TYPE_PROFILE, rule_evaluator::TYPE_ALWAYS];
+        $pick = fn(mixed $value, array $allowed, string $default): string =>
+            in_array((string)$value, $allowed, true) ? (string)$value : $default;
+        $number = fn(mixed $value): string => is_numeric($value) ? (string)$value : '';
+
         $clean = [];
         foreach (array_values($rules) as $rule) {
-            if (!is_array($rule) || !in_array($rule['type'] ?? null, $types, true)) {
+            if (!is_array($rule) || !in_array($rule['type'] ?? null, rule_evaluator::TYPES, true)) {
                 continue;
             }
-            $gradeop = (string)($rule['gradeop'] ?? 'gte');
-            $profileop = (string)($rule['profileop'] ?? 'equals');
-            $gradevalue = (string)($rule['gradevalue'] ?? '');
+            // Earlier rule formats expressed the inversion per type.
+            $negate = !empty($rule['negate'])
+                || ($rule['completion'] ?? '') === 'incomplete'
+                || ($rule['membership'] ?? '') === 'notmember';
+
             $clean[] = [
                 'type' => $rule['type'],
+                'negate' => $negate ? 1 : 0,
                 'gradeitem' => clean_param((string)($rule['gradeitem'] ?? rule_evaluator::GRADE_COURSE), PARAM_TEXT),
-                'gradeop' => in_array($gradeop, rule_evaluator::GRADE_OPERATORS, true) ? $gradeop : 'gte',
-                'gradevalue' => is_numeric($gradevalue) ? $gradevalue : '',
-                'gradeunit' => ($rule['gradeunit'] ?? '') === rule_evaluator::UNIT_POINTS
-                    ? rule_evaluator::UNIT_POINTS : rule_evaluator::UNIT_PERCENT,
-                'completion' => ($rule['completion'] ?? '') === rule_evaluator::COMPLETION_INCOMPLETE
-                    ? rule_evaluator::COMPLETION_INCOMPLETE : rule_evaluator::COMPLETION_COMPLETE,
+                'gradeop' => $pick($rule['gradeop'] ?? '', rule_evaluator::GRADE_OPERATORS, 'gte'),
+                'gradevalue' => $number($rule['gradevalue'] ?? ''),
+                'gradeunit' => $pick($rule['gradeunit'] ?? '', [rule_evaluator::UNIT_POINTS], rule_evaluator::UNIT_PERCENT),
+                'cmid' => max(0, (int)($rule['cmid'] ?? 0)),
                 'profilefield' => clean_param((string)($rule['profilefield'] ?? ''), PARAM_ALPHANUMEXT),
-                'profileop' => in_array($profileop, rule_evaluator::PROFILE_OPERATORS, true) ? $profileop : 'equals',
+                'profileop' => $pick($rule['profileop'] ?? '', rule_evaluator::PROFILE_OPERATORS, 'equals'),
                 'profilevalue' => clean_param((string)($rule['profilevalue'] ?? ''), PARAM_TEXT),
+                'groupid' => max(0, (int)($rule['groupid'] ?? 0)),
+                'cohortid' => max(0, (int)($rule['cohortid'] ?? 0)),
+                'roleid' => max(0, (int)($rule['roleid'] ?? 0)),
+                'badgeid' => max(0, (int)($rule['badgeid'] ?? 0)),
+                'competencyid' => max(0, (int)($rule['competencyid'] ?? 0)),
+                'enrol' => clean_param((string)($rule['enrol'] ?? ''), PARAM_PLUGIN),
+                'datesource' => $pick($rule['datesource'] ?? '', rule_evaluator::DATE_SOURCES, 'completion'),
+                'dateop' => $pick($rule['dateop'] ?? '', rule_evaluator::DATE_OPERATORS, 'before'),
+                'date' => max(0, (int)($rule['date'] ?? 0)),
+                'progressop' => $pick($rule['progressop'] ?? '', rule_evaluator::GRADE_OPERATORS, 'gte'),
+                'progressvalue' => $number($rule['progressvalue'] ?? ''),
+                'hoursop' => $pick($rule['hoursop'] ?? '', rule_evaluator::GRADE_OPERATORS, 'gte'),
+                'hoursvalue' => $number($rule['hoursvalue'] ?? ''),
+                'daysop' => $pick($rule['daysop'] ?? '', rule_evaluator::GRADE_OPERATORS, 'lte'),
+                'daysvalue' => $number($rule['daysvalue'] ?? ''),
+                'combine' => ($rule['combine'] ?? '') === self::COMBINE_AND ? self::COMBINE_AND : '',
                 'text' => (string)($rule['text'] ?? ''),
             ];
             if (count($clean) >= self::MAX_RULES) {
@@ -328,6 +423,29 @@ class element extends base_element implements
      */
     public function get_rules(): array {
         return self::normalise_rules($this->get_payload()['rules'] ?? []);
+    }
+
+    /**
+     * Groups the rules into blocks: rules joined with "AND the next rule" form one block,
+     * whose text is the text of its last rule.
+     *
+     * @param array[] $rules Normalised rules.
+     * @return array[] List of ['rules' => array[], 'text' => string].
+     */
+    public static function group_rules(array $rules): array {
+        $blocks = [];
+        $current = [];
+        foreach ($rules as $rule) {
+            $current[] = $rule;
+            if ($rule['combine'] !== self::COMBINE_AND) {
+                $blocks[] = ['rules' => $current, 'text' => $rule['text']];
+                $current = [];
+            }
+        }
+        if ($current) {
+            $blocks[] = ['rules' => $current, 'text' => end($current)['text']];
+        }
+        return $blocks;
     }
 
     /**
@@ -363,7 +481,7 @@ class element extends base_element implements
         $content = $this->get_content($USER, true);
         if ($content === '') {
             // Always show something so the element can be positioned.
-            $content = s(get_string('pluginname', 'customcertelement_conditionaltext'));
+            $content = s(get_string('pluginname', self::COMPONENT));
         }
         if ($renderer) {
             return (string)$renderer->render_content($this, $content);
@@ -374,8 +492,8 @@ class element extends base_element implements
     /**
      * Resolves the formatted text to print for the user.
      *
-     * In preview mode the first rule's text (or the default text) is shown, so the
-     * designer sees representative content regardless of their own data.
+     * In preview mode the text of the first block of rules (or the default text) is shown,
+     * so the designer sees representative content regardless of their own data.
      *
      * @param stdClass $user The certificate recipient.
      * @param bool $preview
@@ -383,21 +501,24 @@ class element extends base_element implements
      */
     public function get_content(stdClass $user, bool $preview): string {
         $payload = $this->get_payload();
-        $rules = $this->get_rules();
+        $blocks = self::group_rules($this->get_rules());
         $courseid = element_helper::get_courseid($this->get_id());
         $texts = [];
 
         if ($preview) {
-            $texts[] = $rules[0]['text'] ?? (string)($payload['defaulttext'] ?? '');
+            $texts[] = $blocks[0]['text'] ?? (string)($payload['defaulttext'] ?? '');
         } else {
-            $evaluator = new rule_evaluator($courseid);
+            $evaluator = new rule_evaluator($courseid, $this->get_customcertid());
             $all = ($payload['matchmode'] ?? '') === self::MATCH_ALL;
-            foreach ($rules as $rule) {
-                if ($evaluator->matches($rule, $user)) {
-                    $texts[] = $rule['text'];
-                    if (!$all) {
-                        break;
+            foreach ($blocks as $block) {
+                foreach ($block['rules'] as $rule) {
+                    if (!$evaluator->matches($rule, $user)) {
+                        continue 2;
                     }
+                }
+                $texts[] = $block['text'];
+                if (!$all) {
+                    break;
                 }
             }
             if (!$texts) {
@@ -417,6 +538,23 @@ class element extends base_element implements
             $html[] = format_text($text, FORMAT_HTML, ['context' => $context]);
         }
         return implode('<br>', $html);
+    }
+
+    /**
+     * The certificate activity this element belongs to, or 0 for site templates.
+     *
+     * @return int
+     */
+    private function get_customcertid(): int {
+        global $DB;
+
+        return (int)$DB->get_field_sql(
+            'SELECT c.id
+               FROM {customcert} c
+               JOIN {customcert_pages} p ON p.templateid = c.templateid
+              WHERE p.id = ?',
+            [$this->get_pageid()]
+        );
     }
 
     /**
@@ -465,7 +603,7 @@ class element extends base_element implements
     }
 
     /**
-     * Remap grade sources after a course restore.
+     * Remap course-specific references (activities, grade items, groups, course badges) after a restore.
      *
      * @param restore_customcert_activity_task $restore
      * @return void
@@ -476,17 +614,36 @@ class element extends base_element implements
         $payload = $this->get_payload();
         $rules = self::normalise_rules($payload['rules'] ?? []);
         $changed = false;
-        foreach ($rules as &$rule) {
-            $source = $rule['gradeitem'];
-            if ($rule['type'] !== rule_evaluator::TYPE_GRADE || $source === rule_evaluator::GRADE_COURSE || $source === '') {
-                continue;
-            }
-            $isgradeitem = str_starts_with($source, 'gradeitem:');
-            $oldid = (int)($isgradeitem ? substr($source, 10) : $source);
-            $newid = $restore->get_mappingid($isgradeitem ? 'grade_item' : 'course_module', $oldid);
+        $remap = function (string $itemname, int $oldid) use ($restore, &$changed): int {
+            $newid = $oldid ? (int)$restore->get_mappingid($itemname, $oldid) : 0;
             if ($newid) {
-                $rule['gradeitem'] = ($isgradeitem ? 'gradeitem:' : '') . $newid;
                 $changed = true;
+                return $newid;
+            }
+            return $oldid;
+        };
+
+        foreach ($rules as &$rule) {
+            switch ($rule['type']) {
+                case rule_evaluator::TYPE_GROUP:
+                    $rule['groupid'] = $remap('group', $rule['groupid']);
+                    break;
+                case rule_evaluator::TYPE_ACTIVITY:
+                    $rule['cmid'] = $remap('course_module', $rule['cmid']);
+                    break;
+                case rule_evaluator::TYPE_BADGE:
+                    $rule['badgeid'] = $remap('badge', $rule['badgeid']);
+                    break;
+                case rule_evaluator::TYPE_GRADE:
+                    $source = $rule['gradeitem'];
+                    if ($source === rule_evaluator::GRADE_COURSE || $source === '') {
+                        break;
+                    }
+                    $isgradeitem = str_starts_with($source, 'gradeitem:');
+                    $oldid = (int)($isgradeitem ? substr($source, 10) : $source);
+                    $newid = $remap($isgradeitem ? 'grade_item' : 'course_module', $oldid);
+                    $rule['gradeitem'] = ($isgradeitem ? 'gradeitem:' : '') . $newid;
+                    break;
             }
         }
         unset($rule);
@@ -498,42 +655,63 @@ class element extends base_element implements
     }
 
     /**
-     * Grade sources selectable in the form: course total plus the course's grade items.
+     * Rules shown in the form: the requested example, or the stored rules.
      *
-     * @return array<string,string>
+     * @return array[]
      */
-    private static function get_grade_source_options(): array {
-        global $CFG, $COURSE;
-        require_once($CFG->libdir . '/gradelib.php');
-
-        $options = [rule_evaluator::GRADE_COURSE => get_string('coursegrade', 'customcertelement_conditionaltext')];
-        return $options + element_helper::get_grade_items($COURSE);
+    private function get_form_rules(): array {
+        return $this->preset['rules'] ?? $this->get_rules();
     }
 
     /**
-     * Profile fields selectable in the form.
+     * Returns the example requested through the examples menu.
      *
-     * Custom fields hidden from everyone are only offered to users who may view all details,
-     * so a certificate cannot be used to probe values the designer is not allowed to see.
+     * Only honoured when the page is first displayed, never on a form submission,
+     * so loading an example cannot overwrite what the designer is typing.
      *
-     * @return array<string,string>
+     * @return array|null
      */
-    private static function get_profile_field_options(): array {
-        global $CFG, $PAGE;
-        require_once($CFG->dirroot . '/user/profile/lib.php');
+    private function get_requested_preset(): ?array {
+        global $COURSE;
 
-        $fields = [];
-        foreach (rule_evaluator::USER_FIELDS as $field) {
-            $fields[$field] = $field === 'lang' ? get_string('preferredlanguage') : fields::get_display_name($field);
+        $key = optional_param('preset', '', PARAM_ALPHANUMEXT);
+        if ($key === '' || optional_param('rule_repeats', null, PARAM_INT) !== null) {
+            return null;
         }
-        $canviewall = has_capability('moodle/user:viewalldetails', $PAGE->context);
-        foreach (profile_condition::get_custom_profile_fields() as $custom) {
-            if ((int)$custom->visible === (int)PROFILE_VISIBLE_NONE && !$canviewall) {
-                continue;
-            }
-            $fields[(string)$custom->id] = format_string($custom->name);
+        return presets::get($key, (int)$COURSE->id);
+    }
+
+    /**
+     * Dropdown with the ready-made examples. Each item reloads the form with that example.
+     *
+     * @return string HTML
+     */
+    private function render_examples_menu(): string {
+        global $PAGE;
+
+        $items = '';
+        foreach (presets::KEYS as $key) {
+            $url = new \moodle_url($PAGE->url, ['preset' => $key]);
+            $label = \html_writer::tag('strong', get_string("preset_{$key}", self::COMPONENT))
+                . \html_writer::tag('div', get_string("preset_{$key}_desc", self::COMPONENT), ['class' => 'small text-muted']);
+            $items .= \html_writer::tag('li', \html_writer::link($url, $label, [
+                'class' => 'dropdown-item text-wrap',
+                'data-preset' => $key,
+            ]));
         }
-        core_collator::asort($fields);
-        return $fields;
+        $button = \html_writer::tag('button', get_string('loadexample', self::COMPONENT), [
+            'type' => 'button',
+            'class' => 'btn btn-outline-primary dropdown-toggle',
+            'data-bs-toggle' => 'dropdown',
+            'aria-expanded' => 'false',
+        ]);
+        $menu = \html_writer::tag('ul', $items, [
+            'class' => 'dropdown-menu',
+            'style' => 'max-width: 28rem; max-height: 24rem; overflow-y: auto;',
+        ]);
+        $note = $this->preset
+            ? \html_writer::div(get_string('exampleloaded', self::COMPONENT), 'alert alert-info mt-2 mb-0')
+            : '';
+        return \html_writer::div($button . $menu, 'dropdown') . $note;
     }
 }

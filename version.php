@@ -25,11 +25,11 @@
 defined('MOODLE_INTERNAL') || die();
 
 $plugin->component = 'customcertelement_conditionaltext';
-$plugin->version   = 2026111100;
+$plugin->version   = 2026111102;
 $plugin->requires  = 2026100500; // Moodle 5.3.
 $plugin->supported = [503, 503];
 $plugin->maturity  = MATURITY_STABLE;
-$plugin->release   = '1.0.0';
+$plugin->release   = '1.1.0';
 $plugin->dependencies = [
     'mod_customcert' => 2026100500, // Custom certificate 5.3 (Element System v2).
 ];
