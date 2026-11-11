@@ -60,6 +60,22 @@ final class edge_cases_test extends advanced_testcase {
     }
 
     /**
+     * Links (typed or added by filters such as activity names auto-linking) are removed, keeping their text.
+     */
+    public function test_links_are_removed(): void {
+        $this->resetAfterTest();
+        filter_set_global_state('activitynames', TEXTFILTER_ON);
+        [$course, $user] = $this->course_and_user();
+        $this->getDataGenerator()->create_module('page', ['course' => $course->id, 'name' => 'Final exam']);
+        $el = $this->create_element($course, ['rules' => [
+            ['type' => 'always', 'text' => 'Final exam passed, see <a href="https://example.com">details</a>'],
+        ]]);
+        $content = $el->get_content($user, false);
+        $this->assertStringNotContainsString('<a', $content);
+        $this->assertStringContainsString('Final exam passed, see details', $content);
+    }
+
+    /**
      * User data inserted through placeholders is escaped and never expanded a second time.
      */
     public function test_placeholder_values_are_escaped_and_not_reexpanded(): void {

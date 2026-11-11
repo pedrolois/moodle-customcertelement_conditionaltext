@@ -535,7 +535,9 @@ class element extends base_element implements
         $html = [];
         foreach ($texts as $text) {
             $text = $this->replace_placeholders($text, $user, $courseid, $preview);
-            $html[] = format_text($text, FORMAT_HTML, ['context' => $context]);
+            // Filters such as activity names auto-linking add links, which are useless on a certificate:
+            // keep their text only.
+            $html[] = preg_replace('#</?a\b[^>]*>#i', '', format_text($text, FORMAT_HTML, ['context' => $context]));
         }
         return implode('<br>', $html);
     }
@@ -707,7 +709,7 @@ class element extends base_element implements
         ]);
         $menu = \html_writer::tag('ul', $items, [
             'class' => 'dropdown-menu',
-            'style' => 'max-width: 28rem; max-height: 24rem; overflow-y: auto;',
+            'style' => 'width: 26rem; max-width: 90vw; max-height: 24rem; overflow-y: auto;',
         ]);
         $note = $this->preset
             ? \html_writer::div(get_string('exampleloaded', self::COMPONENT), 'alert alert-info mt-2 mb-0')
